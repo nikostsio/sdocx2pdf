@@ -340,7 +340,21 @@ impl Tool {
                 size
             };
 
-            let pressure_override = (!self.is_pressure_sensitive()).then_some(0.45);
+            // Measured directly against real Samsung Notes "Export to PDF" ground truth (see
+            // visual_diff.py / SCORES.md): a fixed-width underline (plain ink, not a
+            // highlighter/marker) rendered at roughly half the real thickness with the old 0.45
+            // override. Highlighters/markers keep the original 0.45: they already get their own
+            // dedicated width multiplier just above, and applying this correction to them too
+            // measurably overshot (a shape-recognised highlighter stroke rendered visibly too
+            // thick) -- there's no evidence the two need the same correction, since one is
+            // compensating for pen geometry and the other for highlighter-specific rendering.
+            let pressure_override = if self.is_pressure_sensitive() {
+                None
+            } else if self.is_like_highlighter() {
+                Some(0.45)
+            } else {
+                Some(0.9)
+            };
 
             Either::Right(strokes.into_iter().filter_map(move |events| {
                 let mut pb = PathBuilder::new();
@@ -823,12 +837,31 @@ fn append_events_basic<'e>(
 ) {
     let pen_size: f64 = pen_size.into();
 
-    let pressure_to_circle_radius =
-        |p: f64, s: f64| -> f64 { pressure_to_circle_radius(pressure_override.unwrap_or(p), s) };
-
     let (events, filtering) = match events {
         EventGroup::Normal(events) => (events, FilteringMode::Raw),
         EventGroup::Shapeified(events) => (events, FilteringMode::Preprocessed),
+    };
+
+    // Widths measured directly against real Samsung Notes "Export to PDF" ground truth (see
+    // visual_diff.py / SCORES.md) showed ordinary pressure-modulated handwriting rendering
+    // noticeably thinner than the real export (roughly 65-75% of the real width). The same
+    // widened range applied to shapeified strokes' own per-point pressure measurably overshot
+    // instead -- e.g. a shape-recognised zigzag and circular strokes rendered visibly too thick.
+    // Since shapeified events describe a generated shape rather than sampled sensor pressure,
+    // there's no reason to expect their pressure values to carry the same meaning as real
+    // handwriting's, so the two are calibrated
+    // separately rather than sharing one clamp range.
+    let pressure_to_circle_radius = move |p: f64, s: f64| -> f64 {
+        if let Some(fixed_fraction) = pressure_override {
+            return 0.5 * s * fixed_fraction;
+        }
+
+        let p = match filtering {
+            FilteringMode::Raw => p.clamp(0.6, 1.0),
+            FilteringMode::Preprocessed => p.clamp(0.4, 0.7),
+        };
+
+        pressure_to_circle_radius(p, s)
     };
 
     let smooth = match StrokeOrDot::from_events(events) {

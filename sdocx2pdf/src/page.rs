@@ -23,7 +23,13 @@ use crate::{
     tool::{EventGroup, Tool},
 };
 
-const A4_PORTRAIT_WIDTH_PT: f64 = 210.0 * 2.84526;
+/// Raw SDOCX page units convert to PDF points at an exact 1:2 ratio. Verified against real Samsung
+/// Notes "Export to PDF" ground truth: a page declaring raw 1200x1697 has an actual exported
+/// /MediaBox of exactly 600x848. This is close to, but is not, an A4-calibrated scale
+/// (210mm/297mm land near 1200/1697 raw units by coincidence); mapping the page width to A4 width
+/// instead produced pages about 0.4% smaller than the real exporter's, which is enough to visibly
+/// misalign thin content once rendered.
+const PT_PER_SDOCX_UNIT: f64 = 0.5;
 
 /// Stores loaded PDFs for embeds.
 pub struct EmbedMap<'e> {
@@ -182,14 +188,9 @@ where
     //     within the format.)
     //
     // We implement the following solutions to these problems:
-    //  1. If there are no useful embeds (see (3) and (4) below) in the whole document, find the
-    //     modal input page size (breaking ties by earliest first appearance) and apply a scale
-    //     that takes the smaller dimension of this modal size to the width of an A4 page. Two very
-    //     simple examples: If every input page is the same size and portrait, then every output
-    //     page will be A4 portrait. If every input page is the same size and landscape, then every
-    //     output page will be A4 landscape. OTOH, if the sizes/orientations are mixed, we do a
-    //     best-effort attempt to get the most common page size as A4-ish as we can while retaining
-    //     aspect ratio.
+    //  1. If there are no useful embeds (see (3) and (4) below) in the whole document, use the
+    //     same fixed scale that Samsung Notes' own "Export to PDF" uses (`PT_PER_SDOCX_UNIT`), so
+    //     every output page has the size the app itself would export it at.
     //  2. Consider all useful embeds (see below) individually. Break ties by earliest appearance,
     //     first by page index and then by index in the array of embeds if comparing two embeds
     //     from the same host page. Of the useful embeds, choose the best per the criteria
@@ -209,11 +210,11 @@ where
     //     source page height / destination box height (equivalently, since we know them to be
     //     almost or exactly equal).
 
-    // If there are no useful embeds, we'll try to match the modal page size to A4; for that, we
-    // need to count the number of times we see each page size. We also store the index at which we
-    // first found each page size so we can choose the earlier size in the case of a tie.
-    let mut page_size_occurrences: HashMap<(OrderedFloat<f64>, OrderedFloat<f64>), (u32, usize)> =
-        HashMap::new();
+    let mut pages = pages.into_iter().peekable();
+
+    // If there are no useful embeds, we fall back to a fixed scale, but only if there are any
+    // pages at all.
+    let any_pages = pages.peek().is_some();
 
     fn aspect_ratio_factor(a: f64, b: f64) -> f64 {
         // This is the factor by which one box is wider (relative to its height) than the other. No
@@ -222,88 +223,69 @@ where
         (a / b).max(b / a) - 1.0
     }
 
-    let scale_candidates = pages
-        .into_iter()
-        .enumerate()
-        .flat_map(|(page_i, (ipb, embeds))| {
-            // Save an indentation level:
-            let input_page_box = ipb;
+    let scale_candidates = pages.flat_map(|(ipb, embeds)| {
+        // Save an indentation level:
+        let input_page_box = ipb;
 
-            // Update the occurrence count for this size. If it's the first occurrence, record the
-            // page index.
-            page_size_occurrences
-                .entry((
-                    input_page_box.width().into(),
-                    input_page_box.height().into(),
-                ))
-                .and_modify(|(count, _)| *count += 1)
-                .or_insert((1, page_i));
+        let host_aspect_ratio = input_page_box.width() / input_page_box.height();
+        let host_area = input_page_box.area();
 
-            let host_aspect_ratio = input_page_box.width() / input_page_box.height();
-            let host_area = input_page_box.area();
+        let extract_candidates = move |(src_box, dest_box): (pdf::Box2d, sdocx::Box2d<f64>)| {
+            let dest_aspect_ratio = dest_box.width() / dest_box.height();
+            let dest_area = dest_box.area();
 
-            let extract_candidates = move |(src_box, dest_box): (pdf::Box2d, sdocx::Box2d<f64>)| {
-                let dest_aspect_ratio = dest_box.width() / dest_box.height();
-                let dest_area = dest_box.area();
+            let dest_host_ar_factor = aspect_ratio_factor(dest_aspect_ratio, host_aspect_ratio);
 
-                let dest_host_ar_factor = aspect_ratio_factor(dest_aspect_ratio, host_aspect_ratio);
+            if dest_host_ar_factor > 0.1 {
+                // Rule 3: One box is more than 10% wider relative to its height than the
+                // other, so the destination box and host page disagree on shape.
+                return None;
+            }
 
-                if dest_host_ar_factor > 0.1 {
-                    // Rule 3: One box is more than 10% wider relative to its height than the
-                    // other, so the destination box and host page disagree on shape.
-                    return None;
-                }
+            let dest_host_area_abs_rel_diff = (dest_area - host_area).abs() / host_area;
 
-                let dest_host_area_abs_rel_diff = (dest_area - host_area).abs() / host_area;
+            if dest_host_area_abs_rel_diff > 0.35 {
+                // Rule 3: The magnitude of the relative difference between the areas of the
+                // destination box and host page is greater than 35%, so the destination box
+                // does not fill the host page well (it is too big or too small).
+                return None;
+            }
 
-                if dest_host_area_abs_rel_diff > 0.35 {
-                    // Rule 3: The magnitude of the relative difference between the areas of the
-                    // destination box and host page is greater than 35%, so the destination box
-                    // does not fill the host page well (it is too big or too small).
-                    return None;
-                }
+            let src_aspect_ratio = src_box.width() / src_box.height();
+            let dest_src_ar_factor = aspect_ratio_factor(dest_aspect_ratio, src_aspect_ratio);
 
-                let src_aspect_ratio = src_box.width() / src_box.height();
-                let dest_src_ar_factor = aspect_ratio_factor(dest_aspect_ratio, src_aspect_ratio);
+            if dest_src_ar_factor > 0.01 {
+                // Rule 4: Dest/source box is more than 1% wider relative to its height than
+                // the other.
+                return None;
+            }
 
-                if dest_src_ar_factor > 0.01 {
-                    // Rule 4: Dest/source box is more than 1% wider relative to its height than
-                    // the other.
-                    return None;
-                }
+            // Per (4), we can take width/width or height/height and it makes little
+            // difference.
+            let proposed_scale =
+                pdf::Length::new(src_box.height()) / sdocx::Length::new(dest_box.height());
 
-                // Per (4), we can take width/width or height/height and it makes little
-                // difference.
-                let proposed_scale =
-                    pdf::Length::new(src_box.height()) / sdocx::Length::new(dest_box.height());
+            Some((
+                proposed_scale,
+                // Sort key, per (3):
+                (
+                    OrderedFloat(dest_host_area_abs_rel_diff),
+                    OrderedFloat(dest_host_ar_factor),
+                ),
+            ))
+        };
 
-                Some((
-                    proposed_scale,
-                    // Sort key, per (3):
-                    (
-                        OrderedFloat(dest_host_area_abs_rel_diff),
-                        OrderedFloat(dest_host_ar_factor),
-                    ),
-                ))
-            };
-
-            embeds.into_iter().filter_map(extract_candidates)
-        });
+        embeds.into_iter().filter_map(extract_candidates)
+    });
 
     // Find the best scale candidate according to (3). `min_by_key` retains an earlier minimum if
     // an equal element is found later, so this respects the tiebreak rules in (2).
     match scale_candidates.min_by_key(|(_ps, key)| *key) {
         Some((scale, _sort_key)) => Some(scale),
         None => {
-            // We didn't find a sensible scale by inspecting embeds, so use the modal page size (if
+            // We didn't find a sensible scale by inspecting embeds, so use the fixed scale (if
             // there were any pages at all).
-            let ((w, h), _) = page_size_occurrences
-                .into_iter()
-                // Maximum count with minimum first-seen index.
-                .max_by_key(|(_, (count, first_seen_index))| (*count, !*first_seen_index))?;
-
-            // Use a scale that maps the smaller dimension of the modal page size to A4 width.
-            Some(pdf::Length::new(A4_PORTRAIT_WIDTH_PT) / sdocx::Length::new(w.min(h).0))
+            any_pages.then(|| euclid::Scale::new(PT_PER_SDOCX_UNIT))
         }
     }
 }

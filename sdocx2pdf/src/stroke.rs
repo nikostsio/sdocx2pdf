@@ -700,10 +700,11 @@ impl StrokeOrDot {
     ) -> StrokeOrDot {
         const COORD_DUPE_TOLERANCE: f64 = f64::EPSILON;
 
-        // Combine consecutive events that occur at the same time or position. Since the events are
-        // in chronological order, the effect is that for every time value we have, there is
-        // exactly one event that occurs at that time.
-        let deduped = events
+        // Combine consecutive events that occur at the same position by taking the mean of their
+        // timestamps and the maximum pressure. Taking the maximum pressure ensures that marks
+        // that are likely to be wider (higher pressure) effectively obscure ones that are likely
+        // to be narrower (lower pressure).
+        let position_deduped: Vec<(f64, f64, f64, f64)> = events
             .into_iter()
             .map(|ev| {
                 (
@@ -713,10 +714,6 @@ impl StrokeOrDot {
                     f64::from(ev.pressure),
                 )
             })
-            // Combine consecutive elements with the same position by taking the mean of their
-            // timestamps and the maximum pressure. Taking the maximum pressure ensures that marks
-            // that are likely to be wider (higher pressure) effectively obscure ones that are
-            // likely to be narrower (lower pressure).
             .coalesce(|a @ (t0, x0, y0, p0), b @ (t1, x1, y1, p1)| {
                 if (x0 - x1).abs() < COORD_DUPE_TOLERANCE && (y0 - y1).abs() < COORD_DUPE_TOLERANCE
                 {
@@ -725,22 +722,53 @@ impl StrokeOrDot {
                     Err((a, b))
                 }
             })
-            // Combine consecutive events with the same timestamp. Since the events are in
-            // chronological order, the effect of this is to ensure that there is at most one event
-            // for any given timestamp.
-            .coalesce(|a @ (t0, x0, y0, p0), b @ (t1, x1, y1, p1)| {
-                if t0 == t1 {
-                    // There are lots of exactly duplicate events in the data for some reason, so
-                    // the two events are likely to be identical. There are sometimes events with
-                    // the same timestamp which are not identical otherwise, however, so we take
-                    // the mean of the other fields.
-                    Ok((t0, 0.5 * (x0 + x1), 0.5 * (y0 + y1), 0.5 * (p0 + p1)))
-                } else {
-                    Err((a, b))
-                }
-            });
+            .collect();
 
-        match deduped.at_most_one() {
+        // Shapeified (auto-straightened/recognised-shape) strokes store many distinct positions
+        // under one single synthetic timestamp, since the points describe a generated shape
+        // rather than a real time-sampled pen movement. Combining consecutive same-timestamp
+        // events (below) is meant to catch only occasional genuine duplicate sensor readings
+        // within an otherwise time-varying stream; naively applied here too, it instead cascades
+        // through every event and collapses the entire shape down to one averaged point (turning
+        // e.g. a whole straight underline into an invisible dot). Detect the all-one-timestamp
+        // case and skip timestamp-based merging entirely rather than let it eat real geometry.
+        let all_same_timestamp = position_deduped
+            .first()
+            .is_some_and(|&(t0, ..)| position_deduped.iter().all(|&(t, ..)| t == t0));
+
+        // Combine consecutive events with the same timestamp. Since the events are in
+        // chronological order, the effect of this is to ensure that there is at most one event
+        // for any given timestamp -- except in the all-same-timestamp case above, where the
+        // timestamp carries no information and every position is kept as-is.
+        let deduped: Vec<(f64, f64, f64, f64)> = if all_same_timestamp {
+            // `ContinuousStroke` parametrises position/pressure as functions of `time` before
+            // reparametrising by arc length, and requires a strictly increasing time axis to do
+            // so. The real (constant) timestamp can't serve as that axis, so substitute point
+            // index instead -- any strictly increasing parameter works equally well here, since
+            // downstream code only uses `time` to drive interpolation, not as a real duration.
+            position_deduped
+                .into_iter()
+                .enumerate()
+                .map(|(i, (_t, x, y, p))| (i as f64, x, y, p))
+                .collect()
+        } else {
+            position_deduped
+                .into_iter()
+                .coalesce(|a @ (t0, x0, y0, p0), b @ (t1, x1, y1, p1)| {
+                    if t0 == t1 {
+                        // There are lots of exactly duplicate events in the data for some reason,
+                        // so the two events are likely to be identical. There are sometimes
+                        // events with the same timestamp which are not identical otherwise,
+                        // however, so we take the mean of the other fields.
+                        Ok((t0, 0.5 * (x0 + x1), 0.5 * (y0 + y1), 0.5 * (p0 + p1)))
+                    } else {
+                        Err((a, b))
+                    }
+                })
+                .collect()
+        };
+
+        match deduped.into_iter().at_most_one() {
             // Single event => dot
             Ok(Some((_time, x, y, pressure))) => StrokeOrDot::Dot { x, y, pressure },
 
