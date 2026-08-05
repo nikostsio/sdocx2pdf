@@ -843,25 +843,35 @@ fn append_events_basic<'e>(
     };
 
     // Widths measured directly against real Samsung Notes "Export to PDF" ground truth (see
-    // visual_diff.py / SCORES.md) showed ordinary pressure-modulated handwriting rendering
-    // noticeably thinner than the real export (roughly 65-75% of the real width). The same
-    // widened range applied to shapeified strokes' own per-point pressure measurably overshot
-    // instead -- e.g. a shape-recognised zigzag and circular strokes rendered visibly too thick.
-    // Since shapeified events describe a generated shape rather than sampled sensor pressure,
-    // there's no reason to expect their pressure values to carry the same meaning as real
-    // handwriting's, so the two are calibrated
-    // separately rather than sharing one clamp range.
+    // visual_diff.py / SCORES.md, --geometry mode's ink-coverage report) showed ordinary
+    // pressure-modulated handwriting rendering noticeably thinner than the real export: even
+    // after raising the pressure clamp range, candidate ink coverage measured only ~58-65% of
+    // ground truth's on a plain-handwriting-heavy page (test1). Since pressure is already
+    // normalised to [0, 1] (see sdocx::page::object::stroke::Event::pressure), the clamp ceiling
+    // can't go any higher to compensate -- the base multiplier itself needs to be bigger here.
+    //
+    // 0.65 is a compromise, not an exact fit: test1/test2/final_test's ink coverage keeps
+    // improving up to a multiplier of ~1.0 (matching ground truth almost exactly), but test3/
+    // test4 already matched well at the original 0.5 and measurably *overshoot* past about 0.6 --
+    // e.g. test3's candidate ink coverage goes from matching gt at 0.5 to 68-85% above it at 1.0.
+    // Full multi-file impact was checked via repeated full-suite reruns (see SCORES.md), not just
+    // the one file being tuned against, which is what caught this. Untried: whatever real
+    // per-file/per-pen difference causes some files to need much more correction than others
+    // (different device/pen hardware? different real pressure distributions?) is not understood,
+    // so this is the best single flat multiplier found, not a real fix for that root cause.
+    //
+    // Applying any of this to shapeified strokes' own per-point pressure measurably overshot
+    // instead (e.g. a shape-recognised zigzag and circular strokes rendered visibly too thick),
+    // so the two keep independently-calibrated multipliers rather than sharing one.
     let pressure_to_circle_radius = move |p: f64, s: f64| -> f64 {
         if let Some(fixed_fraction) = pressure_override {
             return 0.5 * s * fixed_fraction;
         }
 
-        let p = match filtering {
-            FilteringMode::Raw => p.clamp(0.6, 1.0),
-            FilteringMode::Preprocessed => p.clamp(0.4, 0.7),
-        };
-
-        pressure_to_circle_radius(p, s)
+        match filtering {
+            FilteringMode::Raw => 0.65 * s * p.clamp(0.6, 1.0),
+            FilteringMode::Preprocessed => pressure_to_circle_radius(p.clamp(0.4, 0.7), s),
+        }
     };
 
     let smooth = match StrokeOrDot::from_events(events) {
