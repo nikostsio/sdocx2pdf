@@ -505,6 +505,12 @@ impl ShapeDrawingCtx for PageConversionCtx<'_> {
                             )
                         }
 
+                        ImageDrawingError::NotValidPng { name, krilla_err } => {
+                            error!(
+                                "Image '{name}' looks like a PNG but failed to decode: {krilla_err}"
+                            )
+                        }
+
                         ImageDrawingError::ImagePathMissing => {
                             warn!("Found image fill without valid path");
                         }
@@ -544,6 +550,9 @@ pub enum ImageDrawingError {
     #[error("image '{name}' is not a valid JPEG")]
     NotValidJpeg { krilla_err: String, name: String },
 
+    #[error("image '{name}' has a PNG signature but is not a valid PNG")]
+    NotValidPng { krilla_err: String, name: String },
+
     #[error("there is no path for the image")]
     ImagePathMissing,
 }
@@ -580,13 +589,26 @@ impl ImageDrawingCtx for PageConversionCtx<'_> {
             return Err(ImageDrawingError::FailedToRead(err, image_name.into()));
         }
 
-        let image =
+        // Images attached from files can be PNGs rather than JPEGs, and these can rely on real
+        // per-pixel transparency. krilla keeps a PNG's alpha channel (as a soft mask), so a
+        // transparent background doesn't turn opaque black and hide whatever is underneath.
+        const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+        let image = if image_bytes.starts_with(PNG_SIGNATURE) {
+            krilla::image::Image::from_png(image_bytes.into(), true).map_err(|krilla_err| {
+                ImageDrawingError::NotValidPng {
+                    krilla_err,
+                    name: image_name.into(),
+                }
+            })?
+        } else {
             krilla::image::Image::from_jpeg(image_bytes.into(), true).map_err(|krilla_err| {
                 ImageDrawingError::NotValidJpeg {
                     krilla_err,
                     name: image_name.into(),
                 }
-            })?;
+            })?
+        };
 
         // Original box on page (without rotation), crop box (in pixels, with (0, 0) at the top left of the image), and
         // x and y scales to get from image space to SDOCX space.
