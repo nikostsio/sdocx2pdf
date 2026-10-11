@@ -207,6 +207,8 @@ fn create_document_pdf(
             page_ctx.fill_background(r, g, b, a);
         }
 
+        page_ctx.draw_background_template(page.template_type(), page.background_colour());
+
         // Add any embedded PDF pages before drawing the page objects.
         for embed in page.embeds() {
             let src_page_index = embed.page_index() as usize;

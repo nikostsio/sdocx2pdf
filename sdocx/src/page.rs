@@ -395,6 +395,12 @@ impl Page {
     pub const fn background_colour(&self) -> Option<[u8; 4]> {
         self.background_colour
     }
+
+    /// The page's background paper style (lines/grid/dots at some spacing, or a few special
+    /// cases like a PDF template) as chosen in the app's "Change template" menu, if recorded.
+    pub fn template_type(&self) -> Option<&TemplateType> {
+        self.template_type.as_ref()
+    }
 }
 
 impl<R: Read + Seek> TryParseWithContext<R, DocumentContext<'_, '_>> for Page {

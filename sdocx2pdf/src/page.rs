@@ -7,13 +7,19 @@ use std::{
 use anyhow::Context;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use itertools::{Either, Itertools};
-use krilla::{color::rgb, geom::Transform, num::NormalizedF32, paint::Fill, surface::Surface};
+use krilla::{
+    color::rgb,
+    geom::Transform,
+    num::NormalizedF32,
+    paint::{Fill, Stroke},
+    surface::Surface,
+};
 use log::{error, info, warn};
 use num::ToPrimitive;
 use ordered_float::OrderedFloat;
 use sdocx::{
     DocObject, MediaStorage, euclid,
-    page::{PdfPage as EmbeddedPdfPage, object::InlineObject},
+    page::{PdfPage as EmbeddedPdfPage, TemplateType, object::InlineObject},
 };
 use thiserror::Error;
 
@@ -430,6 +436,9 @@ pub struct PageCapture<'p> {
     /// The background colour of the parent page, if there is one.
     background_colour: Option<[u8; 4]>,
 
+    /// The background template (paper style) of the parent page, if there is one.
+    template_type: Option<&'p TemplateType>,
+
     /// The embedded PDF pages captured.
     embeds: Vec<&'p EmbeddedPdfPage>,
 
@@ -477,6 +486,13 @@ impl<'p> PageContent<'p> {
         match self {
             PageContent::Slice(page_capture, ..) => page_capture.background_colour,
             PageContent::WholePage { page, .. } => page.background_colour(),
+        }
+    }
+
+    pub fn template_type(&self) -> Option<&'p TemplateType> {
+        match self {
+            PageContent::Slice(page_capture, ..) => page_capture.template_type,
+            PageContent::WholePage { page, .. } => page.template_type(),
         }
     }
 
@@ -646,6 +662,7 @@ pub fn split_document_into_pages<'d>(
     let content_slices = Vec::from_iter({
         let page_width = page.width as f64;
         let background_colour = page.background_colour();
+        let template_type = page.template_type();
 
         page_breaks
             .tuple_windows()
@@ -668,6 +685,7 @@ pub fn split_document_into_pages<'d>(
                 Some(PageCapture {
                     capture_box,
                     background_colour,
+                    template_type,
                     embeds: page
                         .embedded_pdf_pages()
                         .iter()
@@ -755,6 +773,9 @@ impl DrawObjectError {
 pub struct PageConversionCtx<'s> {
     input_box: sdocx::Box2d<f64>,
 
+    /// The scale from document units to PDF points.
+    input_to_output_scale: euclid::Scale<f64, sdocx::SdocxSpace, pdf::PdfSpace>,
+
     /// PDF drawing surface.
     ///
     /// When the page conversion context is constructed, a transformation matrix is pushed to this
@@ -788,6 +809,7 @@ impl<'s> PageConversionCtx<'s> {
 
         PageConversionCtx {
             input_box: page.input_box(),
+            input_to_output_scale: page.input_to_output_scale(),
             surface,
         }
     }
@@ -801,6 +823,87 @@ impl<'s> PageConversionCtx<'s> {
         }));
 
         self.surface.draw_path(&self.boundary_path());
+    }
+
+    /// Draws the page's background paper style (as chosen in the app's "Change template" menu) on
+    /// top of the background colour `background_bgra`. Only grids are supported.
+    pub fn draw_background_template(
+        &mut self,
+        template_type: Option<&TemplateType>,
+        background_bgra: Option<[u8; 4]>,
+    ) {
+        // Grid line spacing and colour are not recorded anywhere in the document itself
+        // (confirmed absent by inspecting the page's own raw fields directly), so, like the
+        // background colour, the app must be applying a fixed visual template purely from the
+        // template type. Measured directly against a real "Export to PDF" ground truth with a
+        // narrow grid: line spacing is exactly 27pt (measured 112-113px at 300 DPI, dominant
+        // value, both axes, so a square grid), and the line colour is the page's own background
+        // colour darkened by a factor of 0.8 (measured (196,182,171) on a (244,228,215)
+        // background, ~0.80 on every channel). The same factor was independently arrived at for
+        // ruled-paper lines on different ground truth, so Samsung's renderer most likely applies
+        // one fixed darken factor to the background colour for every paper style that draws
+        // lines against it.
+        //
+        // Medium/wide grid spacing (1.5x/2x narrow) is a proportional guess, not measured against
+        // a real export. Line and dot paper styles are not implemented at all for the same
+        // reason: guessing their appearance without a real example to check against risks being
+        // confidently wrong rather than usefully approximate.
+        //
+        // The 0.5pt line width is an empirical compromise, not a measurement: the ground truth's
+        // own rendered line is ~4-5px wide at 300 DPI (~1.0-1.1pt), but matching that width
+        // directly scored *worse* on both documents with a real grid, and a swept-width
+        // comparison (0.1 to 1.0pt) found 0.5pt to be the best net choice. One of the two
+        // documents still has a small residual cost at every width tried, which points at an
+        // unresolved alignment issue rather than a pure calibration gap.
+        const NARROW_GRID_SPACING_PT: f64 = 27.0;
+        const LINE_WIDTH_PT: f64 = 0.5;
+        const DARKEN_FACTOR: f32 = 0.8;
+
+        let spacing_pt = match template_type {
+            Some(TemplateType::NarrowGrid) => NARROW_GRID_SPACING_PT,
+            Some(TemplateType::MediumGrid) => NARROW_GRID_SPACING_PT * 1.5,
+            Some(TemplateType::WideGrid) => NARROW_GRID_SPACING_PT * 2.0,
+            _ => return,
+        };
+
+        // We draw in document units, so convert from points.
+        let spacing = (pdf::Length::new(spacing_pt) / self.input_to_output_scale).get();
+        let line_width = (pdf::Length::new(LINE_WIDTH_PT) / self.input_to_output_scale).get();
+
+        let [b, g, r, _] = background_bgra.unwrap_or([255, 255, 255, 255]);
+        let darken = |c: u8| (f32::from(c) * DARKEN_FACTOR) as u8;
+
+        // Lines are positioned relative to the origin of the whole input page rather than to the
+        // input box, so the grid continues seamlessly across the slices of a split page.
+        let input_box = self.input_box;
+        let mut pb = krilla::geom::PathBuilder::new();
+
+        let mut x = (input_box.min.x / spacing).ceil() * spacing;
+        while x < input_box.max.x {
+            pb.move_to(x as f32, input_box.min.y as f32);
+            pb.line_to(x as f32, input_box.max.y as f32);
+            x += spacing;
+        }
+
+        let mut y = (input_box.min.y / spacing).ceil() * spacing;
+        while y < input_box.max.y {
+            pb.move_to(input_box.min.x as f32, y as f32);
+            pb.line_to(input_box.max.x as f32, y as f32);
+            y += spacing;
+        }
+
+        let Some(path) = pb.finish() else {
+            return;
+        };
+
+        self.surface.set_fill(None);
+        self.surface.set_stroke(Some(Stroke {
+            paint: rgb::Color::new(darken(r), darken(g), darken(b)).into(),
+            width: line_width as f32,
+            ..Stroke::default()
+        }));
+
+        self.surface.draw_path(&path);
     }
 
     fn boundary_path(&self) -> krilla::geom::Path {
