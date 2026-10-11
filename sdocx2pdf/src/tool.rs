@@ -232,8 +232,22 @@ impl Tool {
         // todo: Soft masks for pencil and calligraphy brush
         // todo: Allow dashed/dotted lines
 
+        // Darken (per-channel min(backdrop, source)), not Multiply. Over a plain white page the two
+        // are indistinguishable, which is why Multiply looks correct there. It measurably isn't on
+        // a page with a non-white background: direct pixel sampling of a real "Export to PDF" on
+        // such a page showed e.g. a gray204 shape staying *exactly* (204,204,204), and a
+        // light-blue shape's blue channel getting capped at the background's own blue channel
+        // while its higher red/green channels passed through unchanged. That is, each channel is
+        // independently clamped to whichever of backdrop/source is darker, which is Darken's
+        // definition. Multiply would have scaled every channel down proportionally.
+        //
+        // Darken is also idempotent for repeated same-colour overlap at full alpha
+        // (min(min(bg, c), c) == min(bg, c)). A hand-drawn marker shape (e.g. a thick ring) is
+        // often recorded as several separate overlapping strokes, each drawn independently.
+        // Multiply darkens further every time two such strokes cover the same pixel, producing
+        // visible banding along the overlaps; Darken does not.
         if self.is_like_highlighter() {
-            surface.push_blend_mode(krilla::blend::BlendMode::Multiply);
+            surface.push_blend_mode(krilla::blend::BlendMode::Darken);
         }
 
         let paint: paint::Paint = rgb::Color::new(r, g, b).into();
